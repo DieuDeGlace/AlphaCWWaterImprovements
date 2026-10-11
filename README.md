@@ -49,3 +49,9 @@ Build build.cmd from an x86 Visual Studio developer prompt with Windows SDK. cla
 
 
 Run `build\tests\ReedShoreTest.exe` and `build\tests\ReedOwnershipTest.exe`. The DLL also exports WaterSelfTest for a DLL test harness. Original native water/reed journals stay local and are not distributed. The release includes an empty water-port directory for local journals.
+
+## Source formatting
+
+The project uses the checked-in `.clang-format` style (four-space indentation and a 100-column target). From the repository root, run `clang-format -i src/*.cpp src/*.h` on the source files that exist. Keep third-party SMAA files and embedded shader strings unchanged.
+
+The cleanup was rebuilt with MSVC for x86 and checked against the previous revision for identical executable tokens and shader strings. Runtime settings and installed DLLs are unchanged.
