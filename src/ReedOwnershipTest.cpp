@@ -1,0 +1,5 @@
+#include "ReedOwnership.h"
+#include <map>
+#include <cassert>
+#include <cstdio>
+int main(){std::map<unsigned,unsigned> m{{100,200},{104,300},{108,2},{200,300},{204,100},{300,100},{304,200},{400,400},{404,400},{408,0}};auto read=[&](unsigned a){return m[a];};auto move=[&](unsigned n,unsigned sh,unsigned dh,unsigned sa,unsigned da){std::map<unsigned,unsigned> changes;transferReedLinks(n,sh,dh,sa,da,read,[&](unsigned a,unsigned b){changes[a]=b;});for(auto p:changes)m[p.first]=p.second;};move(200,100,400,108,408);assert(m[100]==300&&m[104]==300&&m[300]==100&&m[304]==100&&m[108]==1);assert(m[400]==200&&m[404]==200&&m[200]==400&&m[204]==400&&m[408]==1);move(300,100,400,108,408);assert(m[100]==100&&m[104]==100&&m[108]==0);assert(m[200]==300&&m[304]==200&&m[300]==400&&m[404]==300&&m[408]==2);move(200,400,100,408,108);assert(m[400]==300&&m[304]==400&&m[408]==1&&m[108]==1);bool rejected=false;try{move(300,400,400,408,408);}catch(...){rejected=true;}assert(rejected);puts("PASS: ownership transfer to empty/populated chunks, single-node removal, reverse transfer, counts and reciprocal links, invalid ownership rejection");}
