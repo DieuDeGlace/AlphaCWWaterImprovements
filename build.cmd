@@ -9,6 +9,8 @@ if errorlevel 1 exit /b 1
 cl /nologo /std:c++17 /O2 /MT /EHsc /DUNICODE /D_UNICODE ReedShoreTest.cpp /Fe..\build\tests\ReedShoreTest.exe
 if errorlevel 1 exit /b 1
 cl /nologo /std:c++17 /O2 /MT /EHsc /DUNICODE /D_UNICODE ReedOwnershipTest.cpp /Fe..\build\tests\ReedOwnershipTest.exe
+if errorlevel 1 exit /b 1
+cl /nologo /std:c++17 /O2 /MT /EHsc LoadedChunkWorkTest.cpp /Fe..\build\tests\LoadedChunkWorkTest.exe
 set "result=%ERRORLEVEL%"
 popd
 exit /b %result%

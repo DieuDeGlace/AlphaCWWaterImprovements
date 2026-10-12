@@ -1,7 +1,9 @@
 # Validation
 
-Packaged installed DLL: `AlphaWater.dll`
+2026-10-12 update. Built MSVC x86 C++17 `/O2 /MT /EHsc`.
 
-SHA-256: `808579abdb39e04f77388823a95ff7fbc0d5fefbcc63145f6144b9ad7ffc8ccd`
+DLL: `AlphaWater.dll`
 
-Release date: 2026-10-11. This is a prototype tested on the developer's installation. See README for tests and limitations.
+SHA-256: `2b158c8a2783d48e4eac0b96c5ba0589242da22a7a42ed82d979d6b310d0abd2`
+
+WaterSelfTest, ReedShoreTest, ReedOwnershipTest, and LoadedChunkWorkTest pass. Scheduler tests cover priority, partial progress, replacement at the same coordinates, unload eviction, idle suppression, and fallback revisits. Live load timing is not yet verified.

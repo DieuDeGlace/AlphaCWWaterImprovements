@@ -16,6 +16,7 @@
 #include <cstdint>
 #include "ReedShore.h"
 #include "ReedOwnership.h"
+#include "LoadedChunkWork.h"
 
 using Bytes = std::vector<unsigned char>;
 static HMODULE ownModule;
@@ -120,7 +121,9 @@ struct Change {
 struct Patch {
     HANDLE process{};
     DWORD pid{}, base{}, dataRva{}, dataSize{}, vtable{}, game{}, layout{};
-    ULONGLONG lastFind{}, lastReeds{}, lastReedLog{};
+    ULONGLONG lastFind{}, lastReeds{}, lastReedLog{}, lastOwnerRepair{};
+    LoadedChunkWork loaded;
+    bool reedBacklog = true;
     std::map<std::pair<int, int>, int> converted;
     using NtCall = LONG(NTAPI *)(HANDLE);
     NtCall suspend{}, resume{};
@@ -359,6 +362,10 @@ struct Patch {
         return out;
     }
     void repairReedOwners() {
+        auto now = GetTickCount64();
+        if (now - lastOwnerRepair < 3000)
+            return;
+        lastOwnerRepair = now;
         int px, py, pz;
         if (!game || !player(game, px, py, pz))
             return;
@@ -489,7 +496,7 @@ struct Patch {
     }
     void relocateReeds() {
         ULONGLONG now = GetTickCount64();
-        if (now - lastReeds < 3000)
+        if (now - lastReeds < (reedBacklog ? 500 : 3000) && !loaded.changed)
             return;
         lastReeds = now;
         int px, py, pz;
@@ -619,6 +626,7 @@ struct Patch {
                 reedLocations.insert({nx, ny});
             }
         }
+        reedBacklog = moves.size() == 8;
         if (moves.empty()) {
             if (examined && now - lastReedLog >= 15000) {
                 char message[128];
@@ -696,6 +704,34 @@ struct Patch {
             log(message);
         }
     }
+    void observeLoadedChunks() {
+        int x, y, z;
+        if (!game || !player(game, x, y, z))
+            return;
+        DWORD width = ptr(game + layout + 0x2d4), cache = ptr(game + layout + 0x2d8);
+        if (!cache || width < 1 || width > 64)
+            return;
+        loaded.begin();
+        for (int cy = std::max(0, y - 96) / 32; cy <= (y + 96) / 32; ++cy)
+            for (int cx = std::max(0, x - 96) / 32; cx <= (x + 96) / 32; ++cx) {
+                DWORD chunk = cache + ((cy % width) * width + cx % width) * 0x268;
+                auto header = read(chunk + 0x18, 8);
+                if (header.size() != 8 || value<int>(header, 0) != cx ||
+                    value<int>(header, 4) != cy)
+                    continue;
+                DWORD cols = columns(cx * 32, cy * 32);
+                if (!cols)
+                    continue;
+                // Flora sentinel replacement also identifies native chunk regeneration.
+                auto flora = read(chunk + 0x240, 8);
+                if (flora.size() != 8)
+                    continue;
+                uint64_t identity = (uint64_t(cols) << 32) |
+                                    (value<DWORD>(flora, 0) ^ (value<DWORD>(flora, 4) * 16777619u));
+                loaded.observe(cx, cy, identity);
+            }
+        loaded.end();
+    }
     int step() {
         int x, y, z;
         if (!game || !player(game, x, y, z)) {
@@ -708,77 +744,85 @@ struct Patch {
                 return 0;
         }
         std::vector<Change> changes;
-        for (int zx = std::max(0, x - 64) / 256; zx <= (x + 64) / 256 && changes.size() < 128; ++zx)
-            for (int zy = std::max(0, y - 64) / 256; zy <= (y + 64) / 256 && changes.size() < 128;
-                 ++zy) {
-                DWORD cols = columns(zx * 256, zy * 256);
-                if (!cols)
-                    continue;
-                Bytes block = read(cols, 256 * 256 * 32);
-                if (block.empty())
-                    continue;
-                for (int ny = std::max(y - 64, zy * 256);
-                     ny <= std::min(y + 64, zy * 256 + 255) && changes.size() < 128; ++ny)
-                    for (int nx = std::max(x - 64, zx * 256);
-                         nx <= std::min(x + 64, zx * 256 + 255) && changes.size() < 128; ++nx) {
-                        size_t offset = (nx % 256 + ny % 256 * 256) * 32;
-                        DWORD count = value<DWORD>(block, offset + 28),
-                              data = value<DWORD>(block, offset + 24);
-                        int bz = value<int>(block, offset + 16);
-                        if (count < 1 || count > 2048 || bz <= -10000 || bz >= 10000)
-                            continue;
-                        Bytes cells = read(data, count * 4);
-                        if (cells.size() != count * 4)
-                            continue;
-                        bool hasSolid = false;
-                        int highest = -1;
-                        for (DWORD i = 0; i < count; ++i)
-                            if ((cells[i * 4 + 3] & 31) == 3) {
-                                hasSolid = true;
-                                highest = i;
-                            }
-                        bool plain = plainWater(cells);
-                        int height = bz, newBase = bz;
-                        Bytes next;
-                        if (hasSolid && !plain) {
-                            next = liquidize(cells);
-                            height = bz + highest;
-                        } else {
-                            Bytes original = cells;
-                            if (!plain) {
-                                auto known = converted.find({nx, ny});
-                                if (known == converted.end())
-                                    continue;
-                                height = known->second;
-                                int wet = 0;
-                                while (wet < (int)count && (cells[wet * 4 + 3] & 31) == 2)
-                                    ++wet;
-                                bool valid = wet > 0 && bz + wet - 1 == height;
-                                for (int i = wet; i < (int)count; ++i)
-                                    if (cells[i * 4 + 3] & 31)
-                                        valid = false;
-                                if (!valid)
-                                    continue;
-                                std::array<unsigned char, 4> air{{255, 255, 255, 0}};
-                                if (wet < (int)count)
-                                    memcpy(air.data(), cells.data() + wet * 4, 4);
-                                original[3] = (cells[3] & 224) | 3;
-                                for (DWORD i = 1; i < count; ++i)
-                                    memcpy(original.data() + i * 4, air.data(), 4);
-                            }
-                            int d = std::min(depth(nx, ny, height), (int)count);
-                            next = deepen(original, d);
-                            newBase = height - (d - 1);
-                        }
-                        if (next.empty() || (next == cells && newBase == bz))
-                            continue;
-                        auto dirty = flags(nx, ny);
-                        if (dirty.empty())
-                            continue;
-                        changes.push_back({nx, ny, height, bz, newBase, cols + (DWORD)offset, data,
-                                           count, cells, next, dirty});
-                    }
+        int cx = 0, cy = 0;
+        auto *work = loaded.next(x / 32, y / 32, GetTickCount64(), cx, cy);
+        if (!work)
+            return 0;
+        DWORD cols = columns(cx * 32, cy * 32);
+        if (!cols)
+            return 0;
+        // Read only this loaded tile's 32 header rows (32 KiB, not a 2 MiB zone).
+        Bytes block(32 * 32 * 32);
+        for (int row = 0; row < 32; ++row) {
+            DWORD offset = ((cx * 32 % 256) + (cy * 32 % 256 + row) * 256) * 32;
+            auto headers = read(cols + offset, 32 * 32);
+            if (headers.size() != 32 * 32)
+                return 0;
+            memcpy(block.data() + row * 32 * 32, headers.data(), headers.size());
+        }
+        for (; work->cursor < 1024 && changes.size() < 128; ++work->cursor) {
+            int nx = cx * 32 + work->cursor % 32;
+            int ny = cy * 32 + work->cursor / 32;
+            size_t offset = work->cursor * 32;
+            DWORD count = value<DWORD>(block, offset + 28), data = value<DWORD>(block, offset + 24);
+            int bz = value<int>(block, offset + 16);
+            if (count < 1 || count > 2048 || bz <= -10000 || bz >= 10000)
+                continue;
+            Bytes cells = read(data, count * 4);
+            if (cells.size() != count * 4)
+                continue;
+            bool hasSolid = false;
+            int highest = -1;
+            for (DWORD i = 0; i < count; ++i)
+                if ((cells[i * 4 + 3] & 31) == 3) {
+                    hasSolid = true;
+                    highest = i;
+                }
+            bool plain = plainWater(cells);
+            int height = bz, newBase = bz;
+            Bytes next;
+            if (hasSolid && !plain) {
+                next = liquidize(cells);
+                height = bz + highest;
+            } else {
+                Bytes original = cells;
+                if (!plain) {
+                    auto known = converted.find({nx, ny});
+                    if (known == converted.end())
+                        continue;
+                    height = known->second;
+                    int wet = 0;
+                    while (wet < (int)count && (cells[wet * 4 + 3] & 31) == 2)
+                        ++wet;
+                    bool valid = wet > 0 && bz + wet - 1 == height;
+                    for (int i = wet; i < (int)count; ++i)
+                        if (cells[i * 4 + 3] & 31)
+                            valid = false;
+                    if (!valid)
+                        continue;
+                    std::array<unsigned char, 4> air{{255, 255, 255, 0}};
+                    if (wet < (int)count)
+                        memcpy(air.data(), cells.data() + wet * 4, 4);
+                    original[3] = (cells[3] & 224) | 3;
+                    for (DWORD i = 1; i < count; ++i)
+                        memcpy(original.data() + i * 4, air.data(), 4);
+                }
+                int d = std::min(depth(nx, ny, height), (int)count);
+                next = deepen(original, d);
+                newBase = height - (d - 1);
             }
+            if (next.empty() || (next == cells && newBase == bz))
+                continue;
+            auto dirty = flags(nx, ny);
+            if (dirty.empty())
+                continue;
+            changes.push_back({nx, ny, height, bz, newBase, cols + (nx % 256 + ny % 256 * 256) * 32,
+                               data, count, cells, next, dirty});
+        }
+        if (work->cursor == 1024) {
+            work->cursor = 0;
+            work->completed = GetTickCount64();
+        }
         if (changes.empty())
             return 0;
         if (suspend(process) != 0)
@@ -859,10 +903,11 @@ extern "C" __declspec(dllexport) void CALLBACK WaterWorker(HWND, HINSTANCE, LPST
         log("Native water + shore reeds worker active: 2-3 depth, stones preserved, no added root geometry");
         DWORD code = 0;
         while (GetExitCodeProcess(patch.process, &code) && code == STILL_ACTIVE) {
+            patch.observeLoadedChunks();
             patch.step();
             patch.relocateReeds();
             patch.repairReedOwners();
-            Sleep(500);
+            Sleep(50);
         }
         log("Water worker stopped with game");
     } catch (const std::exception &e) {
