@@ -413,6 +413,7 @@ struct Patch {
         if (cells.size() != count * 4)
             return out;
         out.valid = true;
+        out.bottom = bz;
         int highestWater = -1;
         for (DWORD i = 0; i < count; i++) {
             int type = cells[i * 4 + 3] & 31;
@@ -580,6 +581,15 @@ struct Patch {
             log(message);
         }
     }
+    // True when every chunk a bank search around (x, y) reads is loaded: the
+    // 48-block search square plus its 4-block shore check.
+    bool searchLoaded(int x, int y) {
+        for (int cy = (y - 52) / 32; cy <= (y + 52) / 32; ++cy)
+            for (int cx = (x - 52) / 32; cx <= (x + 52) / 32; ++cx)
+                if (!loaded.chunks.count({cx, cy}))
+                    return false;
+        return true;
+    }
     void relocateReeds() {
         ULONGLONG now = GetTickCount64();
         // Newly loaded chunks are placed on the same pass they appear; a backlog
@@ -634,7 +644,7 @@ struct Patch {
                 for (int dx = -2; dx <= 2; ++dx)
                     scan.insert({t.first + dx, t.second + dy});
         std::map<std::pair<int, int>, Group> groups;
-        unsigned examined = 0;
+        unsigned examined = 0, pending = 0;
         std::vector<Move> moves;
         std::set<std::pair<int, int>> reserved, rockLocations, reedLocations;
         auto cell = [&](int x, int y) {
@@ -710,35 +720,59 @@ struct Patch {
                     capped = true;
                     break;
                 }
+                // Both native list copies hold each clump; identical placements
+                // at one position are paired in list order.
                 auto second = group.second.find(entry.first);
-                if (entry.second.size() != 1 || second == group.second.end() ||
-                    second->second.size() != 1)
+                if (second == group.second.end() || second->second.size() != entry.second.size())
                     continue;
-                auto &first = entry.second[0];
-                auto &other = second->second[0];
                 int x = (int)(entry.first[0] / 65536), y = (int)(entry.first[1] / 65536);
-                ++examined;
-                int nx, ny, nz;
+                int z = (int)(entry.first[2] / 65536);
                 auto source = cell(x, y);
                 if (source.depth == 0 && dryBank(source))
                     continue;
-                auto placementCell = [&](int xx, int yy) {
-                    auto c = cell(xx, yy);
-                    if (xx == x && yy == y && c.depth == 0) {
-                        c.depth = 1;
-                        c.water = (int)(entry.first[2] / 65536) - 1;
-                    }
-                    return c;
-                };
-                if (!chooseReedBank(x, y, cx, cy, placementCell, occupied, nx, ny, nz))
+                // Already sunk below the riverbed by an earlier pass.
+                if (source.valid && z < source.bottom)
                     continue;
-                Bytes destination(24);
-                int64_t coords[3] = {(int64_t)nx * 65536 + 32768, (int64_t)ny * 65536 + 32768,
-                                     (int64_t)nz * 65536};
-                memcpy(destination.data(), coords, 24);
-                moves.push_back({first, other, destination, key});
-                reserved.insert({nx, ny});
-                reedLocations.insert({nx, ny});
+                for (size_t copy = 0; copy < entry.second.size() && moves.size() < maxMoves;
+                     ++copy) {
+                    auto &first = entry.second[copy];
+                    auto &other = second->second[copy];
+                    ++examined;
+                    int nx, ny, nz;
+                    auto placementCell = [&](int xx, int yy) {
+                        auto c = cell(xx, yy);
+                        if (xx == x && yy == y && c.depth == 0) {
+                            c.depth = 1;
+                            c.water = z - 1;
+                        }
+                        return c;
+                    };
+                    int64_t coords[3];
+                    if (chooseReedBank(x, y, cx, cy, placementCell, occupied, nx, ny, nz)) {
+                        coords[0] = (int64_t)nx * 65536 + 32768;
+                        coords[1] = (int64_t)ny * 65536 + 32768;
+                        coords[2] = (int64_t)nz * 65536;
+                        reserved.insert({nx, ny});
+                        reedLocations.insert({nx, ny});
+                    } else if (source.valid && source.depth > 0 && searchLoaded(x, y)) {
+                        // Standing in water with no free bank anywhere in the fully
+                        // loaded search area: sink it three blocks under the
+                        // riverbed (inside solid terrain), so it is hidden. Only
+                        // its height changes; the clump itself is kept.
+                        coords[0] = entry.first[0];
+                        coords[1] = entry.first[1];
+                        coords[2] = (int64_t)(source.bottom - 3) * 65536;
+                    } else {
+                        // Bank cells not loaded yet: retried when a neighbor loads.
+                        ++pending;
+                        continue;
+                    }
+                    Bytes destination(24);
+                    memcpy(destination.data(), coords, 24);
+                    moves.push_back({first, other, destination, key});
+                }
+                if (moves.size() >= maxMoves)
+                    capped = true;
             }
             // Every clump here is now ashore or has no free site; it is revisited
             // when this chunk or a neighbor loads, or on the quiet recheck.
@@ -749,12 +783,12 @@ struct Patch {
         }
         reedBacklog = more;
         if (moves.empty()) {
-            if (examined && now - lastReedLog >= 15000) {
-                char message[128];
-                sprintf_s(
-                    message,
-                    "Shore scan: %u paired clumps, no unoccupied dry bank within shoreline patches",
-                    examined);
+            if (pending && now - lastReedLog >= 15000) {
+                char message[160];
+                sprintf_s(message,
+                          "Shore scan: %u clumps in water wait for bank chunks to load (%u "
+                          "examined)",
+                          pending, examined);
                 log(message);
                 lastReedLog = now;
             }
@@ -825,10 +859,14 @@ struct Patch {
                 movedFrom.insert(move.from);
         }
         if (applied) {
-            char message[128];
+            unsigned hidden = 0;
+            for (auto &move : moves)
+                hidden += !memcmp(move.destination.data(), move.first.before.data() + 16, 16);
+            char message[160];
             sprintf_s(message,
-                      "Moved %u reed clumps ashore; native stems only, terrain/rocks unchanged",
-                      (unsigned)applied);
+                      "Moved %u reed clumps ashore, sank %u with no free bank under the "
+                      "riverbed; native stems only, terrain/rocks unchanged",
+                      (unsigned)applied - hidden, hidden);
             log(message);
         }
     }
