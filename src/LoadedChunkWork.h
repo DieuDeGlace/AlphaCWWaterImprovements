@@ -1,7 +1,10 @@
 #pragma once
+#include <climits>
 #include <cstdint>
+#include <cstdlib>
 #include <map>
 #include <utility>
+#include <vector>
 
 // Poll only native cache slots, then drain newly loaded chunks before maintenance.
 // A cursor survives a full write batch, so dense water cannot starve later columns.
@@ -16,12 +19,14 @@ struct LoadedChunkWork {
         unsigned cursor{};    // Next column (0..1023) to examine.
     };
     std::map<std::pair<int, int>, State> chunks;
+    std::vector<std::pair<int, int>> fresh; // New or regenerated this pass.
     uint64_t generation{};
     bool changed{}; // A new or regenerated chunk was observed this generation.
 
     void begin() {
         ++generation;
         changed = false;
+        fresh.clear();
     }
     void observe(int x, int y, uint64_t identity) {
         auto &s = chunks[{x, y}];
@@ -29,6 +34,7 @@ struct LoadedChunkWork {
             s = {};
             s.identity = identity;
             changed = true;
+            fresh.push_back({x, y});
         }
         s.seen = generation;
     }
@@ -40,6 +46,13 @@ struct LoadedChunkWork {
             else
                 ++it;
         }
+        for (auto &f : fresh)
+            for (int dy = -neighborRadius; dy <= neighborRadius; ++dy)
+                for (int dx = -neighborRadius; dx <= neighborRadius; ++dx) {
+                    auto it = chunks.find({f.first + dx, f.second + dy});
+                    if (it != chunks.end())
+                        it->second.reedsSettled = false;
+                }
     }
     // Picks the next chunk to work on: never-completed chunks first, then the
     // ones nearest to (px, py). Completed chunks are revisited after 5 s.
@@ -49,9 +62,12 @@ struct LoadedChunkWork {
         int bestDistance = 0;
         for (auto &item : chunks) {
             auto &s = item.second;
-            if (s.completed && now - s.completed < 5000)
-                continue;
             int dx = item.first.first - px, dy = item.first.second - py;
+            if (now < s.retry) // Terrain was briefly unreadable; others go first.
+                continue;
+            if (s.completed &&
+                (now - s.completed < 5000 || std::abs(dx) > revisit || std::abs(dy) > revisit))
+                continue;
             int distance = dx * dx + dy * dy;
             if (!best || (best->completed && !s.completed) ||
                 (bool(best->completed) == bool(s.completed) && distance < bestDistance)) {

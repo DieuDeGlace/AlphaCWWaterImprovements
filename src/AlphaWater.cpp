@@ -15,6 +15,7 @@
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <windows.h>
+#include <timeapi.h>
 #include <tlhelp32.h>
 #include <wincrypt.h>
 #include <algorithm>
@@ -487,6 +488,7 @@ struct Patch {
             return out;
         DWORD count = (DWORD)cells.size() / 4;
         out.valid = true;
+        out.bottom = bz;
         int highestWater = -1;
         for (DWORD i = 0; i < count; i++) {
             int type = material(cells, i);
@@ -636,9 +638,13 @@ struct Patch {
     // one that owns its record and transfers ownership to that chunk.
     void repairReedOwners() {
         auto now = GetTickCount64();
-        if (now - lastOwnerRepair < 3000)
+        // Chunks whose clumps just moved are repaired at once; the quiet
+        // cadence still checks everything near the player.
+        std::set<std::pair<int, int>> sources;
+        sources.swap(movedFrom);
+        bool quiet = now - lastOwnerRepair >= 3000;
+        if (sources.empty() && !quiet)
             return;
-        lastOwnerRepair = now;
         int px, py, pz;
         if (!playerPosition(px, py, pz))
             return;
@@ -677,7 +683,27 @@ struct Patch {
                     transferReed(source, destination, head, node, record);
                     return;
                 }
+                // `next` was read before the transfer and is still in this list.
+                node = next;
             }
+        }
+        if (transferred) {
+            char message[128];
+            sprintf_s(message,
+                      "Reed ownership of %u clumps transferred to bank chunks; native vegetation "
+                      "retained without terrain regeneration",
+                      transferred);
+            log(message);
+        }
+    }
+    // True when every chunk a bank search around (x, y) reads is loaded: the
+    // 48-block search square plus its 4-block shore check.
+    bool searchLoaded(int x, int y) {
+        for (int cy = (y - 52) / 32; cy <= (y + 52) / 32; ++cy)
+            for (int cx = (x - 52) / 32; cx <= (x + 52) / 32; ++cx)
+                if (!loaded.chunks.count({cx, cy}))
+                    return false;
+        return true;
     }
 
     // ---- Reed relocation -------------------------------------------------------
@@ -751,8 +777,27 @@ struct Patch {
                             scan.reserved.insert({x, y});
                         node = value<DWORD>(b, 0);
                     }
-                    if (node != head)
+                    Bytes b = read(node, 72);
+                    if (b.size() != 72) {
                         complete = false;
+                        break;
+                    }
+                    DWORD kind = value<DWORD>(b, 8);
+                    std::array<int64_t, 3> position{value<int64_t>(b, 16), value<int64_t>(b, 24),
+                                                    value<int64_t>(b, 32)};
+                    int x = (int)(position[0] / 65536), y = (int)(position[1] / 65536);
+                    if (kind == 22)
+                        lists[copy][position].push_back({node, head, chunk, b, position});
+                    if (kind == 1) {
+                        for (int ry = -4; ry <= 4; ry++)
+                            for (int rx = -4; rx <= 4; rx++)
+                                rockLocations.insert({x + rx, y + ry});
+                    }
+                    if (kind == 22)
+                        reedLocations.insert({x, y});
+                    if (kind == 1 || kind == 22 || kind >= 31)
+                        reserved.insert({x, y});
+                    node = value<DWORD>(b, 0);
                 }
                 if (!complete)
                     continue;
@@ -920,10 +965,14 @@ struct Patch {
         }
         size_t applied = applyReedMoves(moves);
         if (applied) {
-            char message[128];
+            unsigned hidden = 0;
+            for (auto &move : moves)
+                hidden += !memcmp(move.destination.data(), move.first.before.data() + 16, 16);
+            char message[160];
             sprintf_s(message,
-                      "Moved %u reed clumps ashore; native stems only, terrain/rocks unchanged",
-                      (unsigned)applied);
+                      "Moved %u reed clumps ashore, sank %u with no free bank under the "
+                      "riverbed; native stems only, terrain/rocks unchanged",
+                      (unsigned)applied - hidden, hidden);
             log(message);
         }
     }
@@ -933,12 +982,14 @@ struct Patch {
     // Records which chunks are loaded near the player and whether they changed
     // since the last pass (new chunk or regenerated terrain/flora).
     void observeLoadedChunks() {
+        zoneColumns.clear();
         int x, y, z;
         if (!playerPosition(x, y, z))
             return;
         ChunkCache chunks = chunkCache();
         if (!chunks.valid())
             return;
+        }
         loaded.begin();
         for (int cy = std::max(0, y - SCAN_RADIUS) / CHUNK_SIZE;
              cy <= (y + SCAN_RADIUS) / CHUNK_SIZE; ++cy)
@@ -959,6 +1010,13 @@ struct Patch {
                 loaded.observe(cx, cy, identity);
             }
         loaded.end();
+        for (auto it = shoreTiles.begin(); it != shoreTiles.end();) {
+            auto state = loaded.chunks.find(it->first);
+            if (state == loaded.chunks.end() || state->second.identity != it->second.identity)
+                it = shoreTiles.erase(it);
+            else
+                ++it;
+        }
     }
 
     // Works out the new cells for one column, or returns false if it stays as is.
@@ -1066,6 +1124,10 @@ struct Patch {
             if (!playerPosition(x, y, z))
                 return 0;
         }
+    }
+    // Converts up to one batch of a tile, resuming at its cursor. Returns the
+    // number of columns written, or -1 when the tile could not be read.
+    int convertTile(LoadedChunkWork::State &work, int cx, int cy) {
         std::vector<Change> changes;
         int cx = 0, cy = 0;
         auto *work = loaded.next(x / CHUNK_SIZE, y / CHUNK_SIZE, GetTickCount64(), cx, cy);
@@ -1073,7 +1135,7 @@ struct Patch {
             return 0;
         DWORD cols = columns(cx * CHUNK_SIZE, cy * CHUNK_SIZE);
         if (!cols)
-            return 0;
+            return -1;
         // Read only this loaded tile's 32 header rows (32 KiB, not a 2 MiB zone).
         Bytes block(CHUNK_SIZE * CHUNK_SIZE * COLUMN_HEADER_SIZE);
         for (int row = 0; row < CHUNK_SIZE; ++row) {
@@ -1108,9 +1170,9 @@ struct Patch {
             changes.push_back({nx, ny, height, bz, newBase, cols + columnOffset(nx, ny), data,
                                count, cells, next, dirty});
         }
-        if (work->cursor == 1024) {
-            work->cursor = 0;
-            work->completed = GetTickCount64();
+        if (work.cursor == 1024) {
+            work.cursor = 0;
+            work.completed = GetTickCount64();
         }
         if (changes.empty())
             return 0;
@@ -1167,15 +1229,33 @@ extern "C" __declspec(dllexport) void CALLBACK WaterWorker(HWND, HINSTANCE, LPST
             CloseHandle(mutex);
             return;
         }
-        log("Native water + shore reeds worker active: 2-3 depth, stones preserved, no added root geometry");
+        log("Native water + shore reeds worker active: 2-3 depth, stones preserved, no added root geometry; loaded chunks converted as they appear");
+        // 1 ms sleeps while work remains; the default 15.6 ms timer would
+        // otherwise add a frame of delay to every pass.
+        timeBeginPeriod(1);
         DWORD code = 0;
+        int failures = 0;
         while (GetExitCodeProcess(patch.process, &code) && code == STILL_ACTIVE) {
-            patch.observeLoadedChunks();
-            patch.step();
-            patch.relocateReeds();
-            patch.repairReedOwners();
-            Sleep(50);
+            bool busy = false;
+            try {
+                patch.observeLoadedChunks();
+                // Water first: swimmable terrain is what the player touches.
+                busy = patch.convertWater(8);
+                patch.relocateReeds();
+                patch.repairReedOwners();
+                busy = busy || patch.reedBacklog;
+                failures = 0;
+            } catch (const std::exception &e) {
+                // Each batch rolls back its own writes before throwing, so a
+                // transient failure skips one pass instead of ending the worker.
+                log(e.what());
+                if (++failures >= 10)
+                    throw;
+                Sleep(250);
+            }
+            Sleep(busy ? 1 : 5);
         }
+        timeEndPeriod(1);
         log("Water worker stopped with game");
     } catch (const std::exception &e) {
         log(e.what());

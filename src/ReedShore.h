@@ -1,4 +1,5 @@
 #pragma once
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 
@@ -39,23 +40,29 @@ static bool chooseReedBank(int x, int y, int chunkX, int chunkY, Cell cell, Occu
     const auto source = cell(x, y);
     if (!source.valid || source.depth < 1)
         return false;
-    int best = 0x7fffffff;
-    bool found = false;
-    for (int ny = y - 48; ny <= y + 48; ny++)
-        for (int nx = x - 48; nx <= x + 48; nx++) {
-            if (!reedPatchCell(nx, ny) || occupied(nx, ny))
-                continue;
-            auto c = cell(nx, ny);
-            if (!dryBank(c) || c.ground < source.water - 8 || c.ground > source.water + 8)
-                continue;
-            bool shore = false;
-            for (int dy = -4; dy <= 4 && !shore; dy++)
-                for (int dx = -4; dx <= 4; dx++) {
-                    auto q = cell(nx + dx, ny + dy);
-                    if (q.valid && q.depth > 0 && std::abs(q.water - c.ground) <= 8) {
-                        shore = true;
-                        break;
-                    }
+    int best[2] = {0x7fffffff, 0x7fffffff}, found[2][3]{};
+    for (auto &offset : reedSearchOrder()) {
+        int distance = offset.first * offset.first + offset.second * offset.second;
+        // Patch sites win at any distance; once one is found, nothing farther
+        // can beat it (the score is at least distance * 4).
+        if (distance * 4 > best[0])
+            break;
+        int nx = x + offset.first, ny = y + offset.second;
+        bool patch = reedPatchCell(nx, ny);
+        if (!patch && best[1] != 0x7fffffff)
+            continue; // Only patch sites can still improve the result.
+        if (occupied(nx, ny))
+            continue;
+        auto c = cell(nx, ny);
+        if (!dryBank(c) || c.ground < source.water - 8 || c.ground > source.water + 8)
+            continue;
+        bool shore = false;
+        for (int dy = -4; dy <= 4 && !shore; dy++)
+            for (int dx = -4; dx <= 4; dx++) {
+                auto q = cell(nx + dx, ny + dy);
+                if (q.valid && q.depth > 0 && std::abs(q.water - c.ground) <= 8) {
+                    shore = true;
+                    break;
                 }
             if (!shore)
                 continue;
@@ -69,6 +76,22 @@ static bool chooseReedBank(int x, int y, int chunkX, int chunkY, Cell cell, Occu
                 outZ = c.ground + 1;
                 found = true;
             }
-        }
-    return found;
+        if (!shore)
+            continue;
+        int score = distance * 4 + std::abs(c.ground - source.water) * 2;
+        for (int tier = patch ? 0 : 1; tier < 2; tier++)
+            if (score < best[tier]) {
+                best[tier] = score;
+                found[tier][0] = nx;
+                found[tier][1] = ny;
+                found[tier][2] = c.ground + 1;
+            }
+    }
+    int tier = best[0] != 0x7fffffff ? 0 : best[1] != 0x7fffffff ? 1 : -1;
+    if (tier < 0)
+        return false;
+    outX = found[tier][0];
+    outY = found[tier][1];
+    outZ = found[tier][2];
+    return true;
 }

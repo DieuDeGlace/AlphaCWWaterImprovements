@@ -41,6 +41,24 @@ int main() {
     assert(!chooseReedBank(12, 20, 0, 0, cell, occupied, x, y, z));
     auto rocks = [](int, int) { return ShoreCell{true, 10, 4, -10000, 0, true}; };
     assert(!chooseReedBank(12, 8, 0, 0, rocks, occupied, x, y, z));
-    puts(
-        "PASS: 8 reeds in shoreline patches, rock exclusion, sloping soil, spacing, dry-source rejection");
+    // Fallback: when every patch site is taken, any free dry grass bank beside
+    // the water is used, nearest first; patch sites still win when free.
+    auto patchesTaken = [&](int px, int py) { return reedPatchCell(px, py); };
+    int fx, fy, fz;
+    assert(chooseReedBank(12, 8, 0, 0, cell, patchesTaken, fx, fy, fz));
+    assert(!reedPatchCell(fx, fy) && dryBank(cell(fx, fy)));
+    assert((fx - 12) * (fx - 12) + (fy - 8) * (fy - 8) <= 10); // (9, 9): nearest past the rocks.
+    int px2, py2, pz2;
+    assert(chooseReedBank(12, 8, 0, 0, cell, [](int, int) { return false; }, px2, py2, pz2));
+    assert(reedPatchCell(px2, py2));
+    // No grass bank at all (a lake ringed by sand): nothing to choose, so the
+    // worker sinks the clump under the riverbed once the area is loaded.
+    auto sand = [](int x, int y) {
+        if (y <= 8)
+            return ShoreCell{true, 2, 6, 9, 7};
+        return ShoreCell{true, 10, 5, -10000, 0};
+    };
+    assert(!chooseReedBank(12, 8, 0, 0, sand, [](int, int) { return false; }, fx, fy, fz));
+    puts("PASS: 8 reeds in shoreline patches, rock exclusion, sloping soil, spacing, dry-source "
+         "rejection, nearest non-patch bank fallback, no-bank rejection");
 }
