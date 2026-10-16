@@ -1,6 +1,7 @@
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <windows.h>
+#include <timeapi.h>
 #include <tlhelp32.h>
 #include <wincrypt.h>
 #include <algorithm>
@@ -125,6 +126,22 @@ struct Patch {
     LoadedChunkWork loaded;
     bool reedBacklog = true;
     std::map<std::pair<int, int>, int> converted;
+    // Native chunk cache headers, refreshed with one read per pass.
+    Bytes cacheSlots;
+    DWORD cacheAddress{}, cacheWidth{};
+    // Zone column tables, looked up once per pass instead of per column.
+    std::map<std::pair<int, int>, DWORD> zoneColumns;
+    // Shoreline cells of loaded chunks, read in bulk and kept until the chunk
+    // unloads or regenerates. Water conversion only deepens water, so the
+    // dry-bank and water-depth tests these feed are unaffected by it.
+    struct ShoreTile {
+        uint64_t identity{};
+        std::vector<ShoreCell> cells;
+    };
+    std::map<std::pair<int, int>, ShoreTile> shoreTiles;
+    // Chunks whose clumps moved this pass: their native list ownership is
+    // repaired right away instead of on the quiet cadence.
+    std::set<std::pair<int, int>> movedFrom;
     using NtCall = LONG(NTAPI *)(HANDLE);
     NtCall suspend{}, resume{};
     ~Patch() {
@@ -248,23 +265,51 @@ struct Patch {
         if (x < 0 || y < 0 || x >= 16777216 || y >= 16777216)
             return 0;
         int zx = x / 256, zy = y / 256;
+        auto known = zoneColumns.find({zx, zy});
+        if (known != zoneColumns.end())
+            return known->second;
         DWORD region = ptr(game + layout + 0x398 + ((zx / 64) * 1024 + zy / 64) * 4);
         DWORD zone = region ? ptr(region + 0x10018 + ((zx % 64) * 64 + zy % 64) * 4) : 0;
         Bytes xy = read(zone + 0x60, 8);
-        if (!zone || xy.size() != 8 || value<int>(xy, 0) != zx || value<int>(xy, 4) != zy)
-            return 0;
-        return ptr(zone + 0xa8);
+        DWORD table = 0;
+        if (zone && xy.size() == 8 && value<int>(xy, 0) == zx && value<int>(xy, 4) == zy)
+            table = ptr(zone + 0xa8);
+        zoneColumns[{zx, zy}] = table;
+        return table;
     }
-    std::vector<DWORD> flags(int x, int y) {
-        DWORD width = ptr(game + layout + 0x2d4), cache = ptr(game + layout + 0x2d8);
+    // Loaded chunk (cx, cy) in this pass's cache snapshot, or 0.
+    DWORD chunkAt(int cx, int cy) {
+        if (cx < 0 || cy < 0 || !cacheWidth || cacheSlots.empty())
+            return 0;
+        size_t slot = ((cy % cacheWidth) * cacheWidth + cx % cacheWidth) * 0x268;
+        return value<int>(cacheSlots, slot + 0x18) == cx &&
+                       value<int>(cacheSlots, slot + 0x1c) == cy
+                   ? cacheAddress + (DWORD)slot
+                   : 0;
+    }
+    // Mesh dirty flags of the chunks around a column. `live` re-reads the
+    // native cache (used to validate a batch while the game is paused).
+    std::vector<DWORD> flags(int x, int y, bool live = false) {
+        DWORD width = cacheWidth, cache = cacheAddress;
+        if (live) {
+            width = ptr(game + layout + 0x2d4);
+            cache = ptr(game + layout + 0x2d8);
+        }
         std::vector<DWORD> out;
         if (!cache || width < 1 || width > 64)
             return out;
         for (int cx = (x - 1) / 32; cx <= (x + 1) / 32; ++cx)
             for (int cy = (y - 1) / 32; cy <= (y + 1) / 32; ++cy) {
-                DWORD chunk = cache + ((cy % width) * width + cx % width) * 0x268;
-                Bytes xy = read(chunk + 0x18, 8);
-                if (xy.size() == 8 && value<int>(xy, 0) == cx && value<int>(xy, 4) == cy)
+                DWORD chunk = 0;
+                if (!live)
+                    chunk = chunkAt(cx, cy);
+                else {
+                    DWORD slot = cache + ((cy % width) * width + cx % width) * 0x268;
+                    Bytes xy = read(slot + 0x18, 8);
+                    if (xy.size() == 8 && value<int>(xy, 0) == cx && value<int>(xy, 4) == cy)
+                        chunk = slot;
+                }
+                if (chunk)
                     out.push_back(chunk + 0x74);
             }
         return out;
@@ -323,14 +368,46 @@ struct Patch {
         return ok;
     }
     ShoreCell shoreCell(int x, int y) {
-        ShoreCell out;
         DWORD cols = columns(x, y);
         if (!cols)
-            return out;
-        Bytes column = read(cols + (x % 256 + y % 256 * 256) * 32, 32);
+            return {};
+        return shoreColumn(read(cols + (x % 256 + y % 256 * 256) * 32, 32));
+    }
+    // Shore cell at (x, y): loaded chunks come from a cached bulk read.
+    ShoreCell shoreAt(int x, int y) {
+        if (x < 0 || y < 0)
+            return {};
+        std::pair<int, int> tile{x / 32, y / 32};
+        auto state = loaded.chunks.find(tile);
+        if (state == loaded.chunks.end())
+            return shoreCell(x, y);
+        auto &cached = shoreTiles[tile];
+        if (cached.cells.empty() || cached.identity != state->second.identity) {
+            cached.identity = state->second.identity;
+            cached.cells.assign(1024, ShoreCell{});
+            DWORD cols = columns(tile.first * 32, tile.second * 32);
+            bool complete = cols != 0;
+            for (int row = 0; complete && row < 32; ++row) {
+                DWORD offset =
+                    ((tile.first * 32 % 256) + (tile.second * 32 % 256 + row) * 256) * 32;
+                Bytes headers = read(cols + offset, 32 * 32);
+                complete = headers.size() == 32 * 32;
+                for (int column = 0; complete && column < 32; ++column)
+                    cached.cells[row * 32 + column] = shoreColumn(
+                        Bytes(headers.begin() + column * 32, headers.begin() + column * 32 + 32));
+            }
+            if (!complete) { // Retry the bulk read on the next request.
+                cached.cells.clear();
+                return shoreCell(x, y);
+            }
+        }
+        return cached.cells[(y % 32) * 32 + x % 32];
+    }
+    ShoreCell shoreColumn(const Bytes &column) {
+        ShoreCell out;
         DWORD count = value<DWORD>(column, 28);
         int bz = value<int>(column, 16);
-        if (count < 1 || count > 2048)
+        if (column.size() != 32 || count < 1 || count > 2048)
             return out;
         Bytes cells = read(value<DWORD>(column, 24), count * 4);
         if (cells.size() != count * 4)
@@ -363,148 +440,164 @@ struct Patch {
     }
     void repairReedOwners() {
         auto now = GetTickCount64();
-        if (now - lastOwnerRepair < 3000)
+        // Chunks whose clumps just moved are repaired at once; the quiet
+        // cadence still checks everything near the player.
+        std::set<std::pair<int, int>> sources;
+        sources.swap(movedFrom);
+        bool quiet = now - lastOwnerRepair >= 3000;
+        if (sources.empty() && !quiet)
             return;
-        lastOwnerRepair = now;
         int px, py, pz;
         if (!game || !player(game, px, py, pz))
             return;
-        DWORD width = ptr(game + layout + 0x2d4), cache = ptr(game + layout + 0x2d8);
-        if (!cache || width < 1 || width > 64)
-            return;
-        auto chunkAt = [&](int cx, int cy) {
-            DWORD c = cache + ((cy % width) * width + cx % width) * 0x268;
-            Bytes xy = read(c + 0x18, 8);
-            return xy.size() == 8 && value<int>(xy, 0) == cx && value<int>(xy, 4) == cy ? c : 0;
-        };
-        for (int cy = (py - 96) / 32; cy <= (py + 96) / 32; cy++)
-            for (int cx = (px - 96) / 32; cx <= (px + 96) / 32; cx++) {
-                DWORD source = chunkAt(cx, cy);
-                if (!source)
+        if (quiet) {
+            lastOwnerRepair = now;
+            for (int cy = (py - 96) / 32; cy <= (py + 96) / 32; cy++)
+                for (int cx = (px - 96) / 32; cx <= (px + 96) / 32; cx++)
+                    sources.insert({cx, cy});
+        }
+        unsigned transferred = 0;
+        for (auto &chunk : sources) {
+            int cx = chunk.first, cy = chunk.second;
+            DWORD source = chunkAt(cx, cy);
+            if (!source)
+                continue;
+            DWORD head = ptr(source + 0x248), node = ptr(head);
+            std::set<DWORD> seen;
+            while (node && node != head && seen.size() < 4096) {
+                if (!seen.insert(node).second)
+                    break;
+                Bytes record = read(node, 72);
+                if (record.size() != 72)
+                    break;
+                DWORD next = value<DWORD>(record, 0);
+                int x = (int)(value<int64_t>(record, 16) / 65536),
+                    y = (int)(value<int64_t>(record, 24) / 65536);
+                if (value<DWORD>(record, 8) != 22 || x / 32 == cx && y / 32 == cy) {
+                    node = next;
                     continue;
-                DWORD head = ptr(source + 0x248), node = ptr(head);
-                std::set<DWORD> seen;
-                while (node && node != head && seen.size() < 4096) {
-                    if (!seen.insert(node).second)
-                        break;
-                    Bytes record = read(node, 72);
-                    if (record.size() != 72)
-                        break;
-                    DWORD next = value<DWORD>(record, 0);
-                    int x = (int)(value<int64_t>(record, 16) / 65536),
-                        y = (int)(value<int64_t>(record, 24) / 65536);
-                    if (value<DWORD>(record, 8) != 22 || x / 32 == cx && y / 32 == cy) {
-                        node = next;
-                        continue;
-                    }
-                    DWORD destination = chunkAt(x / 32, y / 32);
-                    if (!destination) {
-                        node = next;
-                        continue;
-                    }
-                    if (suspend(process) != 0)
-                        return;
-                    std::map<DWORD, std::pair<Bytes, Bytes>> edits;
-                    size_t applied = 0;
-                    try {
-                        if (read(node, 72) != record || ptr(source + 0x248) != head || !destination)
-                            throw std::runtime_error("Reed ownership changed before repair");
-                        DWORD nodes[2]{};
-                        for (int copy = 0; copy < 2; copy++) {
-                            DWORD h = ptr(source + 0x240 + copy * 8), n = ptr(h);
-                            unsigned count = 0, matches = 0;
-                            std::set<DWORD> visited;
-                            while (n && n != h && visited.size() < 4096) {
-                                if (!visited.insert(n).second)
-                                    break;
-                                Bytes b = read(n, 72);
-                                if (b.size() != 72)
-                                    break;
-                                if (value<DWORD>(b, 8) == 22 &&
-                                    !memcmp(b.data() + 16, record.data() + 16, 24)) {
-                                    nodes[copy] = n;
-                                    matches++;
-                                }
-                                n = value<DWORD>(b, 0);
-                                count++;
-                            }
-                            if (n != h || matches != 1 || count != ptr(source + 0x244 + copy * 8))
-                                throw std::runtime_error("Native foliage list incomplete");
-                        }
-                        auto stage = [&](DWORD address, const Bytes &after) {
-                            auto old = read(address, after.size());
-                            if (old.size() != after.size())
-                                throw std::runtime_error("Ownership read failed");
-                            auto it = edits.find(address);
-                            if (it == edits.end())
-                                edits.emplace(address, std::make_pair(old, after));
-                            else
-                                it->second.second = after;
-                        };
-                        for (int copy = 0; copy < 2; copy++) {
-                            DWORD sh = ptr(source + 0x240 + copy * 8),
-                                  dh = ptr(destination + 0x240 + copy * 8);
-                            transferReedLinks(
-                                nodes[copy], sh, dh, source + 0x244 + copy * 8,
-                                destination + 0x244 + copy * 8, [&](DWORD a) { return ptr(a); },
-                                [&](DWORD a, DWORD v) { stage(a, intBytes(v)); });
-                        }
-                        // Preserve native vegetation: full terrain rebuild regenerates its original placements.
-                        FILE *journal = nullptr;
-                        if (_wfopen_s(
-                                &journal,
-                                (root() + L"\\water-port\\reed-ownership-originals.bin").c_str(),
-                                L"ab") ||
-                            !journal)
-                            throw std::runtime_error("Ownership journal unavailable");
-                        bool ok = true;
-                        DWORD header[] = {0x41524f31, pid, (DWORD)edits.size()};
-                        ok = fwrite(header, sizeof(header), 1, journal) == 1;
-                        for (auto &e : edits) {
-                            DWORD info[] = {e.first, (DWORD)e.second.first.size()};
-                            ok = ok && fwrite(info, sizeof(info), 1, journal) == 1 &&
-                                 fwrite(e.second.first.data(), e.second.first.size(), 1, journal) ==
-                                     1 &&
-                                 fwrite(e.second.second.data(), e.second.second.size(), 1,
-                                        journal) == 1;
-                        }
-                        ok = ok && fflush(journal) == 0;
-                        fclose(journal);
-                        if (!ok)
-                            throw std::runtime_error("Ownership journal write failed");
-                        for (auto &e : edits) {
-                            ++applied;
-                            if (!write(e.first, e.second.second))
-                                throw std::runtime_error("Ownership write failed");
-                        }
-                        resume(process);
-                        log("Reed ownership transferred to bank chunk; native vegetation retained without terrain regeneration");
-                        return;
-                    } catch (const std::exception &e) {
-                        size_t index = 0;
-                        for (auto &edit : edits) {
-                            if (index++ >= applied)
-                                break;
-                            write(edit.first, edit.second.first);
-                        }
-                        resume(process);
-                        log(e.what());
-                        return;
-                    }
                 }
+                DWORD destination = chunkAt(x / 32, y / 32);
+                if (!destination) {
+                    node = next;
+                    continue;
+                }
+                if (suspend(process) != 0)
+                    return;
+                std::map<DWORD, std::pair<Bytes, Bytes>> edits;
+                size_t applied = 0;
+                try {
+                    if (read(node, 72) != record || ptr(source + 0x248) != head || !destination)
+                        throw std::runtime_error("Reed ownership changed before repair");
+                    DWORD nodes[2]{};
+                    for (int copy = 0; copy < 2; copy++) {
+                        DWORD h = ptr(source + 0x240 + copy * 8), n = ptr(h);
+                        unsigned count = 0, matches = 0;
+                        std::set<DWORD> visited;
+                        while (n && n != h && visited.size() < 4096) {
+                            if (!visited.insert(n).second)
+                                break;
+                            Bytes b = read(n, 72);
+                            if (b.size() != 72)
+                                break;
+                            if (value<DWORD>(b, 8) == 22 &&
+                                !memcmp(b.data() + 16, record.data() + 16, 24)) {
+                                nodes[copy] = n;
+                                matches++;
+                            }
+                            n = value<DWORD>(b, 0);
+                            count++;
+                        }
+                        if (n != h || matches != 1 || count != ptr(source + 0x244 + copy * 8))
+                            throw std::runtime_error("Native foliage list incomplete");
+                    }
+                    auto stage = [&](DWORD address, const Bytes &after) {
+                        auto old = read(address, after.size());
+                        if (old.size() != after.size())
+                            throw std::runtime_error("Ownership read failed");
+                        auto it = edits.find(address);
+                        if (it == edits.end())
+                            edits.emplace(address, std::make_pair(old, after));
+                        else
+                            it->second.second = after;
+                    };
+                    for (int copy = 0; copy < 2; copy++) {
+                        DWORD sh = ptr(source + 0x240 + copy * 8),
+                              dh = ptr(destination + 0x240 + copy * 8);
+                        transferReedLinks(
+                            nodes[copy], sh, dh, source + 0x244 + copy * 8,
+                            destination + 0x244 + copy * 8, [&](DWORD a) { return ptr(a); },
+                            [&](DWORD a, DWORD v) { stage(a, intBytes(v)); });
+                    }
+                    // Preserve native vegetation: full terrain rebuild regenerates its original placements.
+                    FILE *journal = nullptr;
+                    if (_wfopen_s(&journal,
+                                  (root() + L"\\water-port\\reed-ownership-originals.bin").c_str(),
+                                  L"ab") ||
+                        !journal)
+                        throw std::runtime_error("Ownership journal unavailable");
+                    bool ok = true;
+                    DWORD header[] = {0x41524f31, pid, (DWORD)edits.size()};
+                    ok = fwrite(header, sizeof(header), 1, journal) == 1;
+                    for (auto &e : edits) {
+                        DWORD info[] = {e.first, (DWORD)e.second.first.size()};
+                        ok =
+                            ok && fwrite(info, sizeof(info), 1, journal) == 1 &&
+                            fwrite(e.second.first.data(), e.second.first.size(), 1, journal) == 1 &&
+                            fwrite(e.second.second.data(), e.second.second.size(), 1, journal) == 1;
+                    }
+                    ok = ok && fflush(journal) == 0;
+                    fclose(journal);
+                    if (!ok)
+                        throw std::runtime_error("Ownership journal write failed");
+                    for (auto &e : edits) {
+                        ++applied;
+                        if (!write(e.first, e.second.second))
+                            throw std::runtime_error("Ownership write failed");
+                    }
+                    resume(process);
+                    ++transferred;
+                } catch (const std::exception &e) {
+                    size_t index = 0;
+                    for (auto &edit : edits) {
+                        if (index++ >= applied)
+                            break;
+                        write(edit.first, edit.second.first);
+                    }
+                    resume(process);
+                    log(e.what());
+                }
+                // `next` was read before the transfer and is still in this list.
+                node = next;
             }
+        }
+        if (transferred) {
+            char message[128];
+            sprintf_s(message,
+                      "Reed ownership of %u clumps transferred to bank chunks; native vegetation "
+                      "retained without terrain regeneration",
+                      transferred);
+            log(message);
+        }
     }
     void relocateReeds() {
         ULONGLONG now = GetTickCount64();
-        if (now - lastReeds < (reedBacklog ? 500 : 3000) && !loaded.changed)
+        // Newly loaded chunks are placed on the same pass they appear; a backlog
+        // keeps running every pass. Quiet areas near the player are rechecked
+        // every three seconds, as before.
+        bool quiet = now - lastReeds >= 3000;
+        if (!loaded.changed && !reedBacklog && !quiet)
             return;
-        lastReeds = now;
         int px, py, pz;
         if (!game || !player(game, px, py, pz))
             return;
-        DWORD width = ptr(game + layout + 0x2d4), cache = ptr(game + layout + 0x2d8);
-        if (!cache || width < 1 || width > 64)
-            return;
+        if (quiet) {
+            lastReeds = now;
+            for (auto &c : loaded.chunks)
+                if (std::abs(c.first.first * 32 + 16 - px) <= 112 &&
+                    std::abs(c.first.second * 32 + 16 - py) <= 112)
+                    c.second.reedsSettled = false;
+        }
         struct Plant {
             DWORD node, head, chunk;
             Bytes before;
@@ -513,76 +606,110 @@ struct Patch {
         struct Move {
             Plant first, second;
             Bytes destination;
+            std::pair<int, int> from;
         };
         struct Group {
             int cx, cy;
             std::map<std::array<int64_t, 3>, std::vector<Plant>> first, second;
         };
-        std::vector<Group> groups;
+        // Unsettled chunks, nearest first. Neighbors within two chunks are read
+        // too: their rocks, clumps and occupied sites constrain bank choices.
+        constexpr size_t maxTargets = 24, maxMoves = 64;
+        std::vector<std::pair<int, int>> targets;
+        for (auto &c : loaded.chunks)
+            if (!c.second.reedsSettled)
+                targets.push_back(c.first);
+        int pcx = px / 32, pcy = py / 32;
+        std::sort(targets.begin(), targets.end(), [&](auto &a, auto &b) {
+            int da = (a.first - pcx) * (a.first - pcx) + (a.second - pcy) * (a.second - pcy);
+            int db = (b.first - pcx) * (b.first - pcx) + (b.second - pcy) * (b.second - pcy);
+            return da < db;
+        });
+        bool more = targets.size() > maxTargets;
+        if (more)
+            targets.resize(maxTargets);
+        std::set<std::pair<int, int>> wanted(targets.begin(), targets.end()), scan;
+        for (auto &t : targets)
+            for (int dy = -2; dy <= 2; ++dy)
+                for (int dx = -2; dx <= 2; ++dx)
+                    scan.insert({t.first + dx, t.second + dy});
+        std::map<std::pair<int, int>, Group> groups;
         unsigned examined = 0;
         std::vector<Move> moves;
-        std::map<std::pair<int, int>, ShoreCell> cells;
         std::set<std::pair<int, int>> reserved, rockLocations, reedLocations;
         auto cell = [&](int x, int y) {
-            auto key = std::make_pair(x, y);
-            auto found = cells.find(key);
-            if (found == cells.end())
-                found = cells.emplace(key, shoreCell(x, y)).first;
-            found->second.rock = rockLocations.count(key) != 0;
-            return found->second;
+            auto c = shoreAt(x, y);
+            c.rock = rockLocations.count({x, y}) != 0;
+            return c;
         };
-        for (int cy = (py - 96) / 32; cy <= (py + 96) / 32 && moves.size() < 8; cy++)
-            for (int cx = (px - 96) / 32; cx <= (px + 96) / 32 && moves.size() < 8; cx++) {
-                DWORD chunk = cache + ((cy % width) * width + cx % width) * 0x268;
-                Bytes xy = read(chunk + 0x18, 8);
-                if (xy.size() != 8 || value<int>(xy, 0) != cx || value<int>(xy, 4) != cy)
-                    continue;
-                std::map<std::array<int64_t, 3>, std::vector<Plant>> lists[2];
-                bool complete = true;
-                for (int copy = 0; copy < 2; copy++) {
-                    DWORD head = ptr(chunk + 0x240 + copy * 8), node = ptr(head);
-                    std::set<DWORD> seen;
-                    while (node && node != head && seen.size() < 4096) {
-                        if (!seen.insert(node).second) {
-                            complete = false;
-                            break;
-                        }
-                        Bytes b = read(node, 72);
-                        if (b.size() != 72) {
-                            complete = false;
-                            break;
-                        }
-                        DWORD kind = value<DWORD>(b, 8);
-                        std::array<int64_t, 3> position{
-                            value<int64_t>(b, 16), value<int64_t>(b, 24), value<int64_t>(b, 32)};
-                        int x = (int)(position[0] / 65536), y = (int)(position[1] / 65536);
-                        {
-                            if (kind == 22)
-                                lists[copy][position].push_back({node, head, chunk, b, position});
-                            if (kind == 1) {
-                                for (int ry = -4; ry <= 4; ry++)
-                                    for (int rx = -4; rx <= 4; rx++)
-                                        rockLocations.insert({x + rx, y + ry});
-                            }
-                            if (kind == 22)
-                                reedLocations.insert({x, y});
-                            if (kind == 1 || kind == 22 || kind >= 31)
-                                reserved.insert({x, y});
-                        }
-                        node = value<DWORD>(b, 0);
-                    }
-                    if (node != head)
+        for (auto &key : scan) {
+            int cx = key.first, cy = key.second;
+            DWORD chunk = chunkAt(cx, cy);
+            if (!chunk)
+                continue;
+            std::map<std::array<int64_t, 3>, std::vector<Plant>> lists[2];
+            bool complete = true;
+            for (int copy = 0; copy < 2; copy++) {
+                DWORD head = ptr(chunk + 0x240 + copy * 8), node = ptr(head);
+                std::set<DWORD> seen;
+                while (node && node != head && seen.size() < 4096) {
+                    if (!seen.insert(node).second) {
                         complete = false;
+                        break;
+                    }
+                    Bytes b = read(node, 72);
+                    if (b.size() != 72) {
+                        complete = false;
+                        break;
+                    }
+                    DWORD kind = value<DWORD>(b, 8);
+                    std::array<int64_t, 3> position{value<int64_t>(b, 16), value<int64_t>(b, 24),
+                                                    value<int64_t>(b, 32)};
+                    int x = (int)(position[0] / 65536), y = (int)(position[1] / 65536);
+                    if (kind == 22)
+                        lists[copy][position].push_back({node, head, chunk, b, position});
+                    if (kind == 1) {
+                        for (int ry = -4; ry <= 4; ry++)
+                            for (int rx = -4; rx <= 4; rx++)
+                                rockLocations.insert({x + rx, y + ry});
+                    }
+                    if (kind == 22)
+                        reedLocations.insert({x, y});
+                    if (kind == 1 || kind == 22 || kind >= 31)
+                        reserved.insert({x, y});
+                    node = value<DWORD>(b, 0);
                 }
-                if (!complete)
-                    continue;
-                groups.push_back({cx, cy, std::move(lists[0]), std::move(lists[1])});
+                if (node != head)
+                    complete = false;
             }
-        for (auto &group : groups) {
+            if (complete && wanted.count(key))
+                groups[key] = {cx, cy, std::move(lists[0]), std::move(lists[1])};
+        }
+        // Clump centers stay at least 1.1 blocks apart: only the site itself
+        // and its four edge neighbors are closer than that.
+        auto occupied = [&](int x, int y) {
+            if (reserved.count({x, y}))
+                return true;
+            for (auto d :
+                 std::array<std::pair<int, int>, 5>{{{0, 0}, {1, 0}, {-1, 0}, {0, 1}, {0, -1}}})
+                if (reedLocations.count({x + d.first, y + d.second}))
+                    return true;
+            return false;
+        };
+        for (auto &key : targets) {
+            auto found = groups.find(key);
+            if (found == groups.end()) {
+                more = true; // Lists were mid-update; retry next pass.
+                continue;
+            }
+            auto &group = found->second;
             int cx = group.cx, cy = group.cy;
+            bool capped = false;
             for (auto &entry : group.first) {
-                if (moves.size() >= 8)
+                if (moves.size() >= maxMoves) {
+                    capped = true;
                     break;
+                }
                 auto second = group.second.find(entry.first);
                 if (entry.second.size() != 1 || second == group.second.end() ||
                     second->second.size() != 1)
@@ -590,20 +717,8 @@ struct Patch {
                 auto &first = entry.second[0];
                 auto &other = second->second[0];
                 int x = (int)(entry.first[0] / 65536), y = (int)(entry.first[1] / 65536);
-                if (std::abs(x - px) > 96 || std::abs(y - py) > 96)
-                    continue;
                 ++examined;
                 int nx, ny, nz;
-                auto occupied = [&](int x, int y) {
-                    if (reserved.count({x, y}))
-                        return true;
-                    for (auto &reed : reedLocations) {
-                        int dx = x - reed.first, dy = y - reed.second;
-                        if (dx * dx + dy * dy < 1.1f * 1.1f)
-                            return true;
-                    }
-                    return false;
-                };
                 auto source = cell(x, y);
                 if (source.depth == 0 && dryBank(source))
                     continue;
@@ -621,12 +736,18 @@ struct Patch {
                 int64_t coords[3] = {(int64_t)nx * 65536 + 32768, (int64_t)ny * 65536 + 32768,
                                      (int64_t)nz * 65536};
                 memcpy(destination.data(), coords, 24);
-                moves.push_back({first, other, destination});
+                moves.push_back({first, other, destination, key});
                 reserved.insert({nx, ny});
                 reedLocations.insert({nx, ny});
             }
+            // Every clump here is now ashore or has no free site; it is revisited
+            // when this chunk or a neighbor loads, or on the quiet recheck.
+            if (capped)
+                more = true;
+            else
+                loaded.chunks[key].reedsSettled = true;
         }
-        reedBacklog = moves.size() == 8;
+        reedBacklog = more;
         if (moves.empty()) {
             if (examined && now - lastReedLog >= 15000) {
                 char message[128];
@@ -696,6 +817,13 @@ struct Patch {
             throw;
         }
         resume(process);
+        for (auto &move : moves) {
+            int64_t coords[2];
+            memcpy(coords, move.destination.data(), 16);
+            if (std::make_pair(int(coords[0] / 65536) / 32, int(coords[1] / 65536) / 32) !=
+                move.from)
+                movedFrom.insert(move.from);
+        }
         if (applied) {
             char message[128];
             sprintf_s(message,
@@ -704,66 +832,103 @@ struct Patch {
             log(message);
         }
     }
+    // Locates the active character; retried every second while it is absent.
+    bool ready(int &x, int &y, int &z) {
+        if (game && player(game, x, y, z))
+            return true;
+        ULONGLONG now = GetTickCount64();
+        if (now - lastFind < 1000)
+            return false;
+        lastFind = now;
+        find();
+        return game && player(game, x, y, z);
+    }
     void observeLoadedChunks() {
+        zoneColumns.clear();
         int x, y, z;
-        if (!game || !player(game, x, y, z))
+        if (!ready(x, y, z))
             return;
-        DWORD width = ptr(game + layout + 0x2d4), cache = ptr(game + layout + 0x2d8);
-        if (!cache || width < 1 || width > 64)
+        cacheWidth = ptr(game + layout + 0x2d4);
+        cacheAddress = ptr(game + layout + 0x2d8);
+        cacheSlots.clear();
+        if (cacheAddress && cacheWidth >= 1 && cacheWidth <= 64)
+            cacheSlots = read(cacheAddress, cacheWidth * cacheWidth * 0x268);
+        if (cacheSlots.empty()) {
+            cacheWidth = 0;
             return;
+        }
         loaded.begin();
-        for (int cy = std::max(0, y - 96) / 32; cy <= (y + 96) / 32; ++cy)
-            for (int cx = std::max(0, x - 96) / 32; cx <= (x + 96) / 32; ++cx) {
-                DWORD chunk = cache + ((cy % width) * width + cx % width) * 0x268;
-                auto header = read(chunk + 0x18, 8);
-                if (header.size() != 8 || value<int>(header, 0) != cx ||
-                    value<int>(header, 4) != cy)
+        // Every chunk the game holds (its cache is a ring around the player),
+        // not only those near the character, so water and reeds are already
+        // done when the player arrives.
+        int half = (int)cacheWidth / 2, pcx = x / 32, pcy = y / 32;
+        for (int cy = std::max(0, pcy - half); cy <= pcy + half; ++cy)
+            for (int cx = std::max(0, pcx - half); cx <= pcx + half; ++cx) {
+                DWORD chunk = chunkAt(cx, cy);
+                if (!chunk)
                     continue;
                 DWORD cols = columns(cx * 32, cy * 32);
                 if (!cols)
                     continue;
                 // Flora sentinel replacement also identifies native chunk regeneration.
-                auto flora = read(chunk + 0x240, 8);
-                if (flora.size() != 8)
-                    continue;
-                uint64_t identity = (uint64_t(cols) << 32) |
-                                    (value<DWORD>(flora, 0) ^ (value<DWORD>(flora, 4) * 16777619u));
+                size_t slot = chunk - cacheAddress;
+                uint64_t identity =
+                    (uint64_t(cols) << 32) | (value<DWORD>(cacheSlots, slot + 0x240) ^
+                                              (value<DWORD>(cacheSlots, slot + 0x244) * 16777619u));
                 loaded.observe(cx, cy, identity);
             }
         loaded.end();
-    }
-    int step() {
-        int x, y, z;
-        if (!game || !player(game, x, y, z)) {
-            ULONGLONG now = GetTickCount64();
-            if (now - lastFind < 3000)
-                return 0;
-            lastFind = now;
-            find();
-            if (!game || !player(game, x, y, z))
-                return 0;
+        for (auto it = shoreTiles.begin(); it != shoreTiles.end();) {
+            auto state = loaded.chunks.find(it->first);
+            if (state == loaded.chunks.end() || state->second.identity != it->second.identity)
+                it = shoreTiles.erase(it);
+            else
+                ++it;
         }
+    }
+    // Converts water in loaded chunks, nearest first, until `budgetMs` has
+    // passed. Returns true when it stopped with work possibly remaining.
+    bool convertWater(double budgetMs) {
+        int x, y, z;
+        if (!game || cacheSlots.empty() || !player(game, x, y, z))
+            return false;
+        LARGE_INTEGER frequency, start, now;
+        QueryPerformanceFrequency(&frequency);
+        QueryPerformanceCounter(&start);
+        for (;;) {
+            int cx = 0, cy = 0;
+            ULONGLONG tick = GetTickCount64();
+            auto *work = loaded.next(x / 32, y / 32, tick, cx, cy, 3);
+            if (!work)
+                return false;
+            if (convertTile(*work, cx, cy) < 0)
+                work->retry = tick + 250;
+            QueryPerformanceCounter(&now);
+            if ((now.QuadPart - start.QuadPart) * 1000.0 / frequency.QuadPart >= budgetMs)
+                return true;
+        }
+    }
+    // Converts up to one batch of a tile, resuming at its cursor. Returns the
+    // number of columns written, or -1 when the tile could not be read.
+    int convertTile(LoadedChunkWork::State &work, int cx, int cy) {
         std::vector<Change> changes;
-        int cx = 0, cy = 0;
-        auto *work = loaded.next(x / 32, y / 32, GetTickCount64(), cx, cy);
-        if (!work)
-            return 0;
         DWORD cols = columns(cx * 32, cy * 32);
         if (!cols)
-            return 0;
+            return -1;
         // Read only this loaded tile's 32 header rows (32 KiB, not a 2 MiB zone).
         Bytes block(32 * 32 * 32);
         for (int row = 0; row < 32; ++row) {
             DWORD offset = ((cx * 32 % 256) + (cy * 32 % 256 + row) * 256) * 32;
             auto headers = read(cols + offset, 32 * 32);
             if (headers.size() != 32 * 32)
-                return 0;
+                return -1;
             memcpy(block.data() + row * 32 * 32, headers.data(), headers.size());
         }
-        for (; work->cursor < 1024 && changes.size() < 128; ++work->cursor) {
-            int nx = cx * 32 + work->cursor % 32;
-            int ny = cy * 32 + work->cursor / 32;
-            size_t offset = work->cursor * 32;
+        // Up to 256 columns per pause keeps each pause to a few milliseconds.
+        for (; work.cursor < 1024 && changes.size() < 256; ++work.cursor) {
+            int nx = cx * 32 + work.cursor % 32;
+            int ny = cy * 32 + work.cursor / 32;
+            size_t offset = work.cursor * 32;
             DWORD count = value<DWORD>(block, offset + 28), data = value<DWORD>(block, offset + 24);
             int bz = value<int>(block, offset + 16);
             if (count < 1 || count > 2048 || bz <= -10000 || bz >= 10000)
@@ -819,9 +984,9 @@ struct Patch {
             changes.push_back({nx, ny, height, bz, newBase, cols + (nx % 256 + ny % 256 * 256) * 32,
                                data, count, cells, next, dirty});
         }
-        if (work->cursor == 1024) {
-            work->cursor = 0;
-            work->completed = GetTickCount64();
+        if (work.cursor == 1024) {
+            work.cursor = 0;
+            work.completed = GetTickCount64();
         }
         if (changes.empty())
             return 0;
@@ -833,7 +998,7 @@ struct Patch {
             for (auto &c : changes)
                 if (ptr(c.column + 24) == c.data && ptr(c.column + 28) == c.count &&
                     read(c.column + 16, 4) == intBytes(c.oldBase) &&
-                    read(c.data, c.count * 4) == c.before && flags(c.x, c.y) == c.flags)
+                    read(c.data, c.count * 4) == c.before && flags(c.x, c.y, true) == c.flags)
                     valid.push_back(c);
             if (!valid.empty() && !journal(valid))
                 throw std::runtime_error("Could not journal terrain originals");
@@ -900,15 +1065,33 @@ extern "C" __declspec(dllexport) void CALLBACK WaterWorker(HWND, HINSTANCE, LPST
             CloseHandle(mutex);
             return;
         }
-        log("Native water + shore reeds worker active: 2-3 depth, stones preserved, no added root geometry");
+        log("Native water + shore reeds worker active: 2-3 depth, stones preserved, no added root geometry; loaded chunks converted as they appear");
+        // 1 ms sleeps while work remains; the default 15.6 ms timer would
+        // otherwise add a frame of delay to every pass.
+        timeBeginPeriod(1);
         DWORD code = 0;
+        int failures = 0;
         while (GetExitCodeProcess(patch.process, &code) && code == STILL_ACTIVE) {
-            patch.observeLoadedChunks();
-            patch.step();
-            patch.relocateReeds();
-            patch.repairReedOwners();
-            Sleep(50);
+            bool busy = false;
+            try {
+                patch.observeLoadedChunks();
+                // Water first: swimmable terrain is what the player touches.
+                busy = patch.convertWater(8);
+                patch.relocateReeds();
+                patch.repairReedOwners();
+                busy = busy || patch.reedBacklog;
+                failures = 0;
+            } catch (const std::exception &e) {
+                // Each batch rolls back its own writes before throwing, so a
+                // transient failure skips one pass instead of ending the worker.
+                log(e.what());
+                if (++failures >= 10)
+                    throw;
+                Sleep(250);
+            }
+            Sleep(busy ? 1 : 5);
         }
+        timeEndPeriod(1);
         log("Water worker stopped with game");
     } catch (const std::exception &e) {
         log(e.what());
