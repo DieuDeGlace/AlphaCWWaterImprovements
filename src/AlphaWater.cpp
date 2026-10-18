@@ -1,23 +1,23 @@
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
-#include "LoadedChunkWork.h"
-#include "ReedOwnership.h"
-#include "ReedShore.h"
+#include <windows.h>
+#include <timeapi.h>
+#include <tlhelp32.h>
+#include <wincrypt.h>
 #include <algorithm>
 #include <array>
 #include <cmath>
-#include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <map>
 #include <set>
-#include <stdexcept>
 #include <string>
-#include <timeapi.h>
-#include <tlhelp32.h>
 #include <vector>
-#include <wincrypt.h>
-#include <windows.h>
+#include <stdexcept>
+#include <cstdint>
+#include "ReedShore.h"
+#include "ReedOwnership.h"
+#include "LoadedChunkWork.h"
 
 using Bytes = std::vector<unsigned char>;
 static HMODULE ownModule;
