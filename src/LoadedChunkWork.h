@@ -8,21 +8,18 @@
 
 // Poll only native cache slots, then drain newly loaded chunks before maintenance.
 // A cursor survives a full write batch, so dense water cannot starve later columns.
-//
-// Usage per worker tick: begin(); observe() every loaded chunk; end(); then
-// next() picks the chunk to process.
 struct LoadedChunkWork {
     struct State {
-        uint64_t identity{};  // Changes when the chunk is (re)loaded or regenerated.
-        uint64_t seen{};      // Generation in which the chunk was last observed.
-        uint64_t completed{}; // Tick when the last full pass finished (0 = pending).
-        unsigned cursor{};    // Next column (0..1023) to examine.
+        uint64_t identity{}, seen{}, completed{}, retry{};
+        unsigned cursor{};
+        // Reed clumps here are ashore or have no site; cleared when this chunk
+        // or a neighbor (whose bank cells it may use) loads or regenerates.
+        bool reedsSettled{};
     };
     std::map<std::pair<int, int>, State> chunks;
     std::vector<std::pair<int, int>> fresh; // New or regenerated this pass.
     uint64_t generation{};
-    bool changed{}; // A new or regenerated chunk was observed this generation.
-
+    bool changed{};
     void begin() {
         ++generation;
         changed = false;
@@ -38,8 +35,7 @@ struct LoadedChunkWork {
         }
         s.seen = generation;
     }
-    // Forgets chunks that were not observed this generation (unloaded).
-    void end() {
+    void end(int neighborRadius = 2) {
         for (auto it = chunks.begin(); it != chunks.end();) {
             if (it->second.seen != generation)
                 it = chunks.erase(it);
@@ -54,10 +50,9 @@ struct LoadedChunkWork {
                         it->second.reedsSettled = false;
                 }
     }
-    // Picks the next chunk to work on: never-completed chunks first, then the
-    // ones nearest to (px, py). Completed chunks are revisited after 5 s.
-    // Returns nullptr when nothing is due.
-    State *next(int px, int py, uint64_t now, int &x, int &y) {
+    // Unvisited chunks first (nearest first, anywhere in the cache); completed
+    // chunks are revisited after five seconds only within `revisit` chunks.
+    State *next(int px, int py, uint64_t now, int &x, int &y, int revisit = INT_MAX) {
         State *best = nullptr;
         int bestDistance = 0;
         for (auto &item : chunks) {
